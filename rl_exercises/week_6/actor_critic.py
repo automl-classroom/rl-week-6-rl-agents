@@ -6,6 +6,9 @@ Adds GAE for low-variance advantage estimation.
 
 from typing import Any, List, Tuple
 
+import json
+import os
+
 import gymnasium as gym
 import hydra
 import numpy as np
@@ -171,7 +174,14 @@ class ActorCriticAgent(AbstractAgent):
         # TODO: normalize advantages to zero mean and unit variance and use 1e-8 for numerical stability
 
         # return normalized advantages and returns
-        return None
+        returns = self.compute_returns(rewards)
+        states_tensor = torch.stack([torch.from_numpy(s).float() for s in states])
+        values = self.value_fn(states_tensor)
+        advantages = returns - values.detach()
+        advantages = (advantages - advantages.mean()) / (
+            advantages.std(unbiased=False) + 1e-8
+        )
+        return advantages, returns
 
     def compute_gae(
         self,
@@ -214,7 +224,30 @@ class ActorCriticAgent(AbstractAgent):
 
         # TODO: advantages, returns  # replace with actual values (detach both to avoid re-entering the graph)
 
-        return None
+        states_tensor = torch.stack([torch.from_numpy(s).float() for s in states])
+        next_states_tensor = torch.stack(
+            [torch.from_numpy(s).float() for s in next_states]
+        )
+        values = self.value_fn(states_tensor).detach()
+        next_values = self.value_fn(next_states_tensor).detach()
+
+        deltas = (
+            torch.tensor(rewards)
+            + self.gamma * next_values * (1 - torch.tensor(dones, dtype=torch.float32))
+            - values
+        )
+
+        advantages = []
+        adv = 0.0
+        for delta, done in zip(reversed(deltas), reversed(dones)):
+            adv = delta + self.gamma * self.gae_lambda * adv * (1.0 - done)
+            advantages.insert(0, adv)
+        advantages = torch.tensor(advantages)
+        returns = advantages + values
+        advantages = (advantages - advantages.mean()) / (
+            advantages.std(unbiased=False) + 1e-8
+        )
+        return advantages, returns
 
     def update_agent(
         self,
@@ -250,7 +283,13 @@ class ActorCriticAgent(AbstractAgent):
             ret = self.compute_returns(list(rewards))
 
             # TODO: compute advantages by subtracting running return
-            adv = ...
+            ret_mean = ret.mean()
+            adv = ret - self.running_return
+            adv = (adv - adv.mean()) / (adv.std(unbiased=False) + 1e-8)
+            self.running_return = (
+                self.baseline_decay * self.running_return
+                + (1 - self.baseline_decay) * ret_mean
+            )
 
             # TODO: normalize advantages to zero mean and unit variance and use 1e-8 for numerical stability
             # (Reminder, use unbiased=False for torch tensors)
@@ -363,6 +402,13 @@ class ActorCriticAgent(AbstractAgent):
                     print(
                         f"[Eval ] Step {step_count:6d} AvgReturn {mean_r:5.1f} ± {std_r:4.1f}"
                     )
+                    log_dir = f"results/{self.env.spec.id.lower()}"
+                    os.makedirs(log_dir, exist_ok=True)
+                    log_file = os.path.join(log_dir, f"{self.baseline_type}.jsonl")
+                    with open(log_file, "a") as f:
+                        f.write(
+                            json.dumps({"step": step_count, "return": mean_r}) + "\n"
+                        )
 
             policy_loss, value_loss = self.update_agent(trajectory)
             total_return = sum(r for _, _, r, *_ in trajectory)
